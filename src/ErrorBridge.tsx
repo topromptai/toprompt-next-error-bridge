@@ -4,13 +4,19 @@ import { useEffect } from 'react';
 import { post } from './post.js';
 
 /**
- * Client component that installs four error listeners on mount:
+ * Client component that installs four error listeners on mount, plus a
+ * route broadcaster that forwards SPA navigations to the parent window
+ * (so the parent's URL bar tracks iframe navigation and a refresh lands
+ * the user back on the same page they were debugging).
  *
  *   1. window.onerror           — uncaught runtime JS errors
  *   2. unhandledrejection       — unhandled promise rejections
  *   3. console.error override   — React / library errors that only log
  *   4. MutationObserver on the Next.js <nextjs-portal> shadow DOM — Turbopack
  *      / webpack build errors that render the dev error overlay
+ *   5. history.pushState / replaceState / popstate — emits `__route_change`
+ *      postMessage events every time the SPA navigates, including the
+ *      initial path on mount.
  *
  * Drop it near the top of your root layout (once). It renders nothing.
  *
@@ -108,6 +114,54 @@ export function ErrorBridge(): null {
       if (overlay) pollOverlayShadowRoot(overlay);
     });
 
+    // 5. Route-change broadcaster — posts the current path to the parent
+    //    every time the SPA navigates. The parent uses this to keep its
+    //    address bar in sync with the iframe AND to restore the same page
+    //    after a hot-reload triggered by a code edit / fix.
+    //
+    //    Next.js App Router navigates via `history.pushState`, not via
+    //    full page loads, so we hook that directly plus `popstate` for
+    //    browser back/forward. Also fires once on mount to report the
+    //    initial pathname.
+    const postRoute = (): void => {
+      try {
+        if (typeof window === 'undefined') return;
+        if (!window.parent || window.parent === window) return;
+        const path =
+          (window.location.pathname || '/') +
+          (window.location.search || '') +
+          (window.location.hash || '');
+        window.parent.postMessage(
+          { type: '__route_change', path, timestamp: Date.now() },
+          '*',
+        );
+      } catch {
+        // Ignore — cross-origin access or closed parent window
+      }
+    };
+
+    const origPushState = history.pushState;
+    const origReplaceState = history.replaceState;
+    history.pushState = function (...args) {
+      const ret = origPushState.apply(this, args as Parameters<typeof history.pushState>);
+      // Defer one tick so `location` reflects the new URL before we read it.
+      queueMicrotask(postRoute);
+      return ret;
+    };
+    history.replaceState = function (...args) {
+      const ret = origReplaceState.apply(
+        this,
+        args as Parameters<typeof history.replaceState>,
+      );
+      queueMicrotask(postRoute);
+      return ret;
+    };
+    const onPopState = (): void => postRoute();
+    window.addEventListener('popstate', onPopState);
+    // Initial route on mount — parent needs to know where we started, and this
+    // doubles as the "we're alive" signal after a bridge reload.
+    postRoute();
+
     window.addEventListener('error', onError);
     window.addEventListener('unhandledrejection', onRejection);
     observer.observe(document.documentElement, { childList: true, subtree: true });
@@ -119,6 +173,9 @@ export function ErrorBridge(): null {
     return () => {
       window.removeEventListener('error', onError);
       window.removeEventListener('unhandledrejection', onRejection);
+      window.removeEventListener('popstate', onPopState);
+      history.pushState = origPushState;
+      history.replaceState = origReplaceState;
       observer.disconnect();
       console.error = origConsoleError;
     };
