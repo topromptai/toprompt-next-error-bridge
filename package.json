@@ -1,0 +1,48 @@
+{
+  "name": "@toprompt/next-error-bridge",
+  "version": "0.1.0",
+  "description": "Error bridge for Next.js apps — forwards runtime, build, console, and React render errors from an iframe preview to the parent window via postMessage. Designed for AI coding environments like toPrompt.",
+  "keywords": [
+    "nextjs",
+    "error-bridge",
+    "error-boundary",
+    "postmessage",
+    "iframe",
+    "preview",
+    "toprompt"
+  ],
+  "author": "toPrompt",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo node_modules"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
