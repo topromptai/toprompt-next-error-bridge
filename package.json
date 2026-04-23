@@ -31,7 +31,8 @@
     "build": "tsup src/index.ts --format esm --dts --clean",
     "dev": "tsup src/index.ts --format esm --dts --watch",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist .turbo node_modules"
+    "clean": "rm -rf dist .turbo node_modules",
+    "prepare": "tsup src/index.ts --format esm --dts --clean"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
