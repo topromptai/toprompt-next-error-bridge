@@ -39,6 +39,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     post('__TOPROMPT_ERROR__', {
       message: error.message || 'React render error',
       stack: error.stack,
+      errorName: error.name,
       componentStack: info.componentStack ?? undefined,
       source: 'react-boundary',
     });

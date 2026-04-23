@@ -1,25 +1,31 @@
 'use client';
 
 import { useEffect } from 'react';
-import { post } from './post.js';
+import { post, postReady } from './post.js';
 
 /**
- * Client component that installs four error listeners on mount, plus a
- * route broadcaster that forwards SPA navigations to the parent window
- * (so the parent's URL bar tracks iframe navigation and a refresh lands
- * the user back on the same page they were debugging).
+ * Client component that installs a complete error + navigation + inspector
+ * bridge between the preview iframe and the parent IDE. Drop it near the
+ * top of your root layout (once). It renders nothing.
  *
+ * Captures:
  *   1. window.onerror           — uncaught runtime JS errors
  *   2. unhandledrejection       — unhandled promise rejections
- *   3. console.error override   — React / library errors that only log
- *   4. MutationObserver on the Next.js <nextjs-portal> shadow DOM — Turbopack
- *      / webpack build errors that render the dev error overlay
- *   5. history.pushState / replaceState / popstate — emits `__route_change`
- *      postMessage events every time the SPA navigates, including the
- *      initial path on mount.
+ *   3. console.error override   — React / library errors, incl. stack + component stack
+ *   4. Next.js <nextjs-portal>  — Turbopack/webpack build errors (parses file:line:col)
  *
- * Drop it near the top of your root layout (once). It renders nothing.
+ * Broadcasts:
+ *   5. history.pushState/replaceState/popstate/hashchange → `__route_change`
+ *      so the parent's URL bar tracks iframe navigation and refresh lands on
+ *      the same page.
+ *   6. `__TOPROMPT_BRIDGE_READY__` once on mount — parent uses this to know the
+ *      bridge is alive, its version, and the initial path.
  *
+ * Listens:
+ *   7. `__inspector_toggle` → when active, clicks send `__element_selected` so
+ *      the IDE can enter a click-to-inspect / click-to-edit mode.
+ *
+ * Usage:
  *   <body>
  *     <ErrorBridge />
  *     <ErrorBoundary>{children}</ErrorBoundary>
@@ -27,44 +33,67 @@ import { post } from './post.js';
  */
 export function ErrorBridge(): null {
   useEffect(() => {
+    // ─────────────────────────────────────────────────────────────────────
     // 1. Uncaught runtime errors
+    // ─────────────────────────────────────────────────────────────────────
     const onError = (event: ErrorEvent) => {
+      const errorName =
+        (event.error && typeof event.error === 'object' && (event.error as Error).name) ||
+        undefined;
       post('__TOPROMPT_ERROR__', {
         message: event.message || 'Unknown error',
         file: event.filename,
         line: event.lineno,
         col: event.colno,
         stack: event.error?.stack,
+        errorName,
         source: 'window.onerror',
       });
     };
 
+    // ─────────────────────────────────────────────────────────────────────
     // 2. Unhandled promise rejections
+    // ─────────────────────────────────────────────────────────────────────
     const onRejection = (event: PromiseRejectionEvent) => {
       const reason = event.reason as unknown;
-      const message =
-        reason instanceof Error
-          ? reason.message
-          : typeof reason === 'string'
-            ? reason
-            : (() => {
-                try {
-                  return JSON.stringify(reason);
-                } catch {
-                  return String(reason);
-                }
-              })();
+      const isErr = reason instanceof Error;
+      const message = isErr
+        ? reason.message
+        : typeof reason === 'string'
+          ? reason
+          : (() => {
+              try {
+                return JSON.stringify(reason);
+              } catch {
+                return String(reason);
+              }
+            })();
       post('__TOPROMPT_ERROR__', {
         message: message || 'Unhandled promise rejection',
-        stack: reason instanceof Error ? reason.stack : undefined,
+        stack: isErr ? reason.stack : undefined,
+        errorName: isErr ? reason.name : undefined,
         source: 'unhandledrejection',
       });
     };
 
-    // 3. console.error override — catches React warnings + library errors
+    // ─────────────────────────────────────────────────────────────────────
+    // 3. console.error override — extracts stack from Error args and React's
+    //    componentStack when present (React's internal pattern is
+    //    `console.error("…message with %s…", props, errorObject)`).
+    // ─────────────────────────────────────────────────────────────────────
     const origConsoleError = console.error;
     console.error = function (...args: unknown[]) {
       try {
+        // First Error instance gives us the real stack
+        const firstError = args.find((a): a is Error => a instanceof Error);
+        // React-style componentStack — look for an object arg with a
+        // `componentStack` string field (React 18/19 devtools pattern).
+        const compStackObj = args.find(
+          (a): a is { componentStack: string } =>
+            typeof a === 'object' &&
+            a !== null &&
+            typeof (a as { componentStack?: unknown }).componentStack === 'string',
+        );
         const message = args
           .map((a) => {
             if (a instanceof Error) return a.message;
@@ -76,7 +105,13 @@ export function ErrorBridge(): null {
             }
           })
           .join(' ');
-        post('__TOPROMPT_CONSOLE_ERROR__', { message, source: 'console.error' });
+        post('__TOPROMPT_CONSOLE_ERROR__', {
+          message,
+          stack: firstError?.stack,
+          errorName: firstError?.name,
+          componentStack: compStackObj?.componentStack,
+          source: 'console.error',
+        });
       } catch {
         // Never let the bridge itself throw
       }
@@ -84,12 +119,30 @@ export function ErrorBridge(): null {
       origConsoleError.apply(console, args as any);
     };
 
-    // 4. Next.js error overlay observer (Turbopack + webpack dev)
-    //    Next.js renders errors inside a shadow-dom <nextjs-portal> element.
+    // ─────────────────────────────────────────────────────────────────────
+    // 4. Next.js error overlay observer — parses file:line:col from the text
+    //    so downstream consumers don't have to scrape it themselves.
+    //    Overlay text always contains "./src/app/foo.tsx:12:34" format.
+    // ─────────────────────────────────────────────────────────────────────
+    const parseOverlayLocation = (
+      text: string,
+    ): { file?: string; line?: number; col?: number } => {
+      if (!text) return {};
+      const m = text.match(
+        /(?:^|\s|\()(?:\.\/|\/)?((?:src|app)\/[^\s:()`'"]+\.(?:tsx?|jsx?|mjs|cjs|css)):(\d+)(?::(\d+))?/m,
+      );
+      if (!m) return {};
+      const [, file, line, col] = m;
+      return {
+        file,
+        line: Number.isFinite(Number(line)) ? Number(line) : undefined,
+        col: col && Number.isFinite(Number(col)) ? Number(col) : undefined,
+      };
+    };
+
     const pollOverlayShadowRoot = (portal: Element): void => {
       const sr = (portal as unknown as { shadowRoot: ShadowRoot | null }).shadowRoot;
       if (!sr) {
-        // Shadow root may not be attached yet — retry once
         setTimeout(() => {
           const retry = (portal as unknown as { shadowRoot: ShadowRoot | null }).shadowRoot;
           if (retry) extractAndPost(retry);
@@ -102,8 +155,13 @@ export function ErrorBridge(): null {
     const extractAndPost = (sr: ShadowRoot): void => {
       const body = sr.querySelector('[data-nextjs-dialog-body]');
       if (body?.textContent) {
+        const rawText = body.textContent.trim().slice(0, 5000); // bumped from 2k
+        const loc = parseOverlayLocation(rawText);
         post('__TOPROMPT_BUILD_ERROR__', {
-          message: body.textContent.trim().slice(0, 2000),
+          message: rawText,
+          file: loc.file,
+          line: loc.line,
+          col: loc.col,
           source: 'nextjs-overlay',
         });
       }
@@ -114,15 +172,10 @@ export function ErrorBridge(): null {
       if (overlay) pollOverlayShadowRoot(overlay);
     });
 
-    // 5. Route-change broadcaster — posts the current path to the parent
-    //    every time the SPA navigates. The parent uses this to keep its
-    //    address bar in sync with the iframe AND to restore the same page
-    //    after a hot-reload triggered by a code edit / fix.
-    //
-    //    Next.js App Router navigates via `history.pushState`, not via
-    //    full page loads, so we hook that directly plus `popstate` for
-    //    browser back/forward. Also fires once on mount to report the
-    //    initial pathname.
+    // ─────────────────────────────────────────────────────────────────────
+    // 5. Route broadcaster — mirrors iframe SPA navigation to the parent.
+    //    Hooks history.pushState, replaceState, popstate, and hashchange.
+    // ─────────────────────────────────────────────────────────────────────
     const postRoute = (): void => {
       try {
         if (typeof window === 'undefined') return;
@@ -136,7 +189,7 @@ export function ErrorBridge(): null {
           '*',
         );
       } catch {
-        // Ignore — cross-origin access or closed parent window
+        // Ignore
       }
     };
 
@@ -144,7 +197,6 @@ export function ErrorBridge(): null {
     const origReplaceState = history.replaceState;
     history.pushState = function (...args) {
       const ret = origPushState.apply(this, args as Parameters<typeof history.pushState>);
-      // Defer one tick so `location` reflects the new URL before we read it.
       queueMicrotask(postRoute);
       return ret;
     };
@@ -157,25 +209,119 @@ export function ErrorBridge(): null {
       return ret;
     };
     const onPopState = (): void => postRoute();
+    const onHashChange = (): void => postRoute();
     window.addEventListener('popstate', onPopState);
-    // Initial route on mount — parent needs to know where we started, and this
-    // doubles as the "we're alive" signal after a bridge reload.
-    postRoute();
+    window.addEventListener('hashchange', onHashChange);
 
+    // ─────────────────────────────────────────────────────────────────────
+    // 7. Inspector mode — when the parent sends `__inspector_toggle`, attach
+    //    a click listener that captures target element info and posts it
+    //    back as `__element_selected`. Toggled off when not active so we
+    //    don't interfere with normal app clicks.
+    // ─────────────────────────────────────────────────────────────────────
+    let inspectorActive = false;
+    let inspectorMoveEl: HTMLElement | null = null;
+    const INSPECTOR_OUTLINE = '2px dashed rgba(99, 102, 241, 0.8)';
+
+    const clearInspectorOutline = (): void => {
+      if (inspectorMoveEl) {
+        inspectorMoveEl.style.outline = inspectorMoveEl.dataset.__topromptPrevOutline || '';
+        delete inspectorMoveEl.dataset.__topromptPrevOutline;
+        inspectorMoveEl = null;
+      }
+    };
+
+    const buildSelector = (el: Element): string => {
+      if (!(el instanceof Element)) return '';
+      if (el.id) return `#${el.id}`;
+      const tag = el.tagName.toLowerCase();
+      const cls = typeof el.className === 'string' && el.className
+        ? '.' + el.className.trim().split(/\s+/).slice(0, 3).join('.')
+        : '';
+      return `${tag}${cls}`;
+    };
+
+    const onInspectorMove = (e: MouseEvent): void => {
+      const target = e.target as HTMLElement | null;
+      if (!target || target === inspectorMoveEl) return;
+      clearInspectorOutline();
+      inspectorMoveEl = target;
+      target.dataset.__topromptPrevOutline = target.style.outline || '';
+      target.style.outline = INSPECTOR_OUTLINE;
+    };
+
+    const onInspectorClick = (e: MouseEvent): void => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        window.parent.postMessage(
+          {
+            type: '__element_selected',
+            tag: target.tagName.toLowerCase(),
+            text: (target.textContent || '').trim().slice(0, 200),
+            classes: typeof target.className === 'string' ? target.className : '',
+            selector: buildSelector(target),
+            pathname:
+              (window.location.pathname || '/') +
+              (window.location.search || '') +
+              (window.location.hash || ''),
+          },
+          '*',
+        );
+      } catch {
+        // Ignore
+      }
+    };
+
+    const enableInspector = (): void => {
+      if (inspectorActive) return;
+      inspectorActive = true;
+      document.body.style.cursor = 'crosshair';
+      document.addEventListener('mousemove', onInspectorMove, true);
+      document.addEventListener('click', onInspectorClick, true);
+    };
+
+    const disableInspector = (): void => {
+      if (!inspectorActive) return;
+      inspectorActive = false;
+      document.body.style.cursor = '';
+      clearInspectorOutline();
+      document.removeEventListener('mousemove', onInspectorMove, true);
+      document.removeEventListener('click', onInspectorClick, true);
+    };
+
+    const onParentMessage = (event: MessageEvent): void => {
+      const data = event.data as { type?: string; active?: boolean } | null;
+      if (!data || typeof data !== 'object' || typeof data.type !== 'string') return;
+      if (data.type === '__inspector_toggle') {
+        if (data.active) enableInspector();
+        else disableInspector();
+      }
+    };
+    window.addEventListener('message', onParentMessage);
+
+    // Register global listeners
     window.addEventListener('error', onError);
     window.addEventListener('unhandledrejection', onRejection);
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
-    // Handle the case where the overlay is already mounted on first render
+    // Initial state broadcasts
     const existingOverlay = document.querySelector('nextjs-portal');
     if (existingOverlay) pollOverlayShadowRoot(existingOverlay);
+    postRoute();   // initial path
+    postReady();   // "bridge alive" ping
 
     return () => {
       window.removeEventListener('error', onError);
       window.removeEventListener('unhandledrejection', onRejection);
       window.removeEventListener('popstate', onPopState);
+      window.removeEventListener('hashchange', onHashChange);
+      window.removeEventListener('message', onParentMessage);
       history.pushState = origPushState;
       history.replaceState = origReplaceState;
+      disableInspector();
       observer.disconnect();
       console.error = origConsoleError;
     };
